@@ -19,7 +19,6 @@ This tool allows you to list playlists, view tracks, create new playlists, and a
 - **Git:** Required by `pipx` to install from a GitHub repository.
 - **pipx:** Recommended for installing Python CLI applications in isolated environments.
 - **A Spotify Account:** To manage your playlists.
-- **Spotify Developer Application:** You'll need to create one to get a Client ID.
 
 ## Installation
 
