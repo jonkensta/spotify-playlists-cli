@@ -6,6 +6,7 @@ Command-line interface (CLI) tool for managing Spotify playlists using the Spoti
 
 import argparse
 import base64
+import hashlib  # Added for PKCE
 import json
 import logging
 import os
@@ -18,16 +19,19 @@ from urllib.parse import parse_qs, urlencode, urlparse
 import requests
 
 # --- Constants ---
-# IMPORTANT: Replace these with your actual Spotify Application credentials
-# You can get these from the Spotify Developer Dashboard: https://developer.spotify.com/dashboard/
+# IMPORTANT: Replace this with your actual Spotify Application Client ID
+# You can get this from the Spotify Developer Dashboard: https://developer.spotify.com/dashboard/
 CLIENT_ID = "YOUR_CLIENT_ID"
-CLIENT_SECRET = "YOUR_CLIENT_SECRET"
 
 # IMPORTANT: Make sure this Redirect URI is added to your Spotify Application's settings
 # in the Spotify Developer Dashboard.
 REDIRECT_URI = "http://127.0.0.1:8888/callback"  # Ensure port is free
 
-TOKEN_FILE = ".spotify_tokens.json"  # Stores tokens in the current directory
+# Determine script directory for storing token and log files
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN_FILE_NAME = ".spotify_tokens.json"
+TOKEN_FILE_PATH = os.path.join(SCRIPT_DIR, TOKEN_FILE_NAME)
+
 API_BASE_URL = "https://api.spotify.com/v1"
 AUTH_URL = "https://accounts.spotify.com/authorize"
 TOKEN_URL = "https://accounts.spotify.com/api/token"
@@ -43,50 +47,46 @@ SCOPES_LIST = [
 ]
 
 # --- Global state for the OAuth server ---
-# These are used by the HTTP server to communicate back to the main thread during login
 AUTH_CODE_GLOBAL = None
 AUTH_STATE_RECEIVED_GLOBAL = None
-OAUTH_HTTP_SERVER_GLOBAL = None  # Holds the HTTPServer instance
-
-# --- Logging Setup ---
-# Configured in main() based on command-line arguments
+OAUTH_HTTP_SERVER_GLOBAL = None
+PKCE_CODE_VERIFIER_GLOBAL = None  # To store code_verifier for token exchange
 
 
 # --- Token Management ---
 def save_tokens(tokens):
-    """Saves tokens to the TOKEN_FILE."""
+    """Saves tokens to the TOKEN_FILE_PATH."""
     try:
-        with open(TOKEN_FILE, "w", encoding="utf-8") as f:
+        with open(TOKEN_FILE_PATH, "w", encoding="utf-8") as f:
             json.dump(tokens, f, indent=4)
-        logging.info("Tokens saved to %s", TOKEN_FILE)
+        logging.info("Tokens saved to %s", TOKEN_FILE_PATH)
     except IOError as e:
-        logging.error("Error saving tokens to %s: %s", TOKEN_FILE, e)
+        logging.error("Error saving tokens to %s: %s", TOKEN_FILE_PATH, e)
         print(f"Warning: Could not save tokens: {e}")
 
 
 def load_tokens():
-    """Loads tokens from the TOKEN_FILE."""
-    if not os.path.exists(TOKEN_FILE):
-        logging.debug("Token file %s not found.", TOKEN_FILE)
+    """Loads tokens from the TOKEN_FILE_PATH."""
+    if not os.path.exists(TOKEN_FILE_PATH):
+        logging.debug("Token file %s not found.", TOKEN_FILE_PATH)
         return None
     try:
-        with open(TOKEN_FILE, "r", encoding="utf-8") as f:
+        with open(TOKEN_FILE_PATH, "r", encoding="utf-8") as f:
             tokens = json.load(f)
-            # Basic validation
             if not all(
                 key in tokens for key in ["access_token", "refresh_token", "expires_at"]
             ):
                 logging.warning(
                     "Token file %s is malformed or missing essential keys. Discarding.",
-                    TOKEN_FILE,
+                    TOKEN_FILE_PATH,
                 )
-                clear_tokens()  # Remove malformed file
+                clear_tokens()
                 return None
             return tokens
     except (IOError, json.JSONDecodeError) as e:
-        logging.error("Error loading tokens from %s: %s", TOKEN_FILE, e)
+        logging.error("Error loading tokens from %s: %s", TOKEN_FILE_PATH, e)
         print(
-            f"Warning: Could not load tokens from {TOKEN_FILE}. It might be corrupted. Error: {e}"
+            f"Warning: Could not load tokens from {TOKEN_FILE_PATH}. It might be corrupted. Error: {e}"
         )
         clear_tokens()
         return None
@@ -94,53 +94,50 @@ def load_tokens():
 
 def clear_tokens():
     """Removes the token file."""
-    if os.path.exists(TOKEN_FILE):
+    if os.path.exists(TOKEN_FILE_PATH):
         try:
-            os.remove(TOKEN_FILE)
-            logging.info("Token file %s removed.", TOKEN_FILE)
+            os.remove(TOKEN_FILE_PATH)
+            logging.info("Token file %s removed.", TOKEN_FILE_PATH)
         except OSError as e:
-            logging.error("Error removing token file %s: %s", TOKEN_FILE, e)
+            logging.error("Error removing token file %s: %s", TOKEN_FILE_PATH, e)
 
 
 def refresh_access_token():
-    """Refreshes the access token using the stored refresh token."""
-    logging.info("Attempting to refresh access token.")
+    """Refreshes the access token using the stored refresh token (PKCE flow)."""
+    logging.info("Attempting to refresh access token using PKCE flow.")
     tokens = load_tokens()
     if not tokens or "refresh_token" not in tokens:
-        logging.error(
-            "No refresh token found. Please login again using the 'login' command."
-        )
+        logging.error("No refresh token found. Please login again.")
         print("No refresh token available. Please use the 'login' command.")
         return False
 
-    payload = {"grant_type": "refresh_token", "refresh_token": tokens["refresh_token"]}
-
-    auth_string = f"{CLIENT_ID}:{CLIENT_SECRET}"
-    b64_auth_string = base64.b64encode(auth_string.encode()).decode()
-    headers = {
-        "Authorization": f"Basic {b64_auth_string}",
-        "Content-Type": "application/x-www-form-urlencoded",
+    payload = {
+        "grant_type": "refresh_token",
+        "refresh_token": tokens["refresh_token"],
+        "client_id": CLIENT_ID,  # Required for PKCE refresh
     }
 
     try:
-        response = requests.post(TOKEN_URL, data=payload, headers=headers, timeout=10)
+        # No Authorization header with client secret for PKCE refresh
+        response = requests.post(TOKEN_URL, data=payload, timeout=10)
         response.raise_for_status()
 
         new_token_data = response.json()
         tokens["access_token"] = new_token_data["access_token"]
         tokens["expires_at"] = time.time() + new_token_data["expires_in"]
+        # Spotify might issue a new refresh token, update if provided
         if "refresh_token" in new_token_data:
             tokens["refresh_token"] = new_token_data["refresh_token"]
 
         save_tokens(tokens)
-        logging.info("Access token refreshed and saved successfully.")
+        logging.info("Access token refreshed (PKCE) and saved successfully.")
         return True
 
     except requests.exceptions.RequestException as e:
-        logging.error("Error refreshing access token: %s", e)
+        logging.error("Error refreshing access token (PKCE): %s", e)
         if hasattr(e, "response") and e.response is not None:
             logging.error("Refresh token response content: %s", e.response.text)
-            if e.response.status_code in [400, 401]:
+            if e.response.status_code in [400, 401]:  # Bad request, invalid grant
                 logging.error(
                     "Refresh token is invalid or revoked. Clearing tokens. Please login again."
                 )
@@ -163,7 +160,7 @@ def get_access_token():
         if not refresh_access_token():
             logging.warning("Failed to refresh access token.")
             return None
-        tokens = load_tokens()
+        tokens = load_tokens()  # Reload after successful refresh
 
     return tokens.get("access_token") if tokens else None
 
@@ -182,7 +179,9 @@ def make_spotify_request(
     """
     request_headers = headers.copy() if headers else {}
 
-    if TOKEN_URL not in url and AUTH_URL not in url:
+    if (
+        TOKEN_URL not in url and AUTH_URL not in url
+    ):  # i.e., not an auth-related request itself
         access_token = get_access_token()
         if not access_token:
             logging.error("API request failed: No valid access token. Please login.")
@@ -228,39 +227,37 @@ def make_spotify_request(
                 continue
 
             if response.status_code == 401 and not is_retry_after_refresh:
-                logging.warning(
-                    "Received 401 Unauthorized. Attempting token refresh for API request."
-                )
+                logging.warning("Received 401 Unauthorized. Attempting token refresh.")
                 if refresh_access_token():
                     logging.info("Token refreshed. Retrying original API request.")
-                    refreshed_token = load_tokens()["access_token"]
-                    request_headers["Authorization"] = f"Bearer {refreshed_token}"
-                    return make_spotify_request(
-                        url,
-                        method,
-                        request_headers,
-                        data,
-                        params,
-                        is_retry_after_refresh=True,
-                    )
+                    refreshed_token_data = load_tokens()
+                    if refreshed_token_data and "access_token" in refreshed_token_data:
+                        request_headers["Authorization"] = (
+                            f"Bearer {refreshed_token_data['access_token']}"
+                        )
+                        # Retry the same request immediately, once. Mark it as a retry after refresh.
+                        return make_spotify_request(
+                            url,
+                            method,
+                            request_headers,
+                            data,
+                            params,
+                            is_retry_after_refresh=True,
+                        )
+                    else:
+                        logging.error(
+                            "Failed to load refreshed token. Please login again."
+                        )
+                        print("Authentication failed. Please use the 'login' command.")
+                        return None
                 else:
-                    logging.error(
-                        "Token refresh failed after 401 during API request. Please login again."
-                    )
-                    print(
-                        "Authentication failed (token might be expired or invalid). Please use the 'login' command."
-                    )
+                    logging.error("Token refresh failed after 401. Please login again.")
+                    print("Authentication failed. Please use the 'login' command.")
                     return None
 
             response.raise_for_status()
-
-            if (
-                response.status_code == 204 or not response.content
-            ):  # Handle 204 No Content or empty responses
-                return {
-                    "status": "success",
-                    "status_code": response.status_code,
-                }  # Indicate success
+            if response.status_code == 204 or not response.content:
+                return {"status": "success", "status_code": response.status_code}
             return response.json()
 
         except requests.exceptions.HTTPError as e:
@@ -271,24 +268,21 @@ def make_spotify_request(
                 url,
             )
             error_details = e.response.text
-            try:  # Try to parse JSON error from Spotify
+            try:
                 error_json = e.response.json()
                 error_message = error_json.get("error", {}).get(
                     "message", e.response.text
                 )
                 error_details = f"{error_message} (Status: {e.response.status_code})"
             except json.JSONDecodeError:
-                pass  # Use raw text if not JSON
-
+                pass
             print(f"API Error: {error_details}")
             if e.response.status_code == 403:
                 print(
                     "This might be due to insufficient permissions (scopes) for your token."
                 )
             return None
-        except (
-            requests.exceptions.RequestException
-        ) as e:  # Other errors (timeout, connection error)
+        except requests.exceptions.RequestException as e:
             logging.error(
                 "Spotify API Request failed: %s. Attempt %s/%s",
                 e,
@@ -296,11 +290,8 @@ def make_spotify_request(
                 max_retries,
             )
             if current_retry < max_retries - 1:
-                time.sleep(
-                    1 + (2**current_retry)
-                )  # Exponential backoff for network issues
+                time.sleep(1 + (2**current_retry))
             current_retry += 1
-
     logging.error(
         "Max retries reached for %s %s. Request failed permanently.", method, url
     )
@@ -318,11 +309,9 @@ class _CallbackHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         global AUTH_CODE_GLOBAL, AUTH_STATE_RECEIVED_GLOBAL, OAUTH_HTTP_SERVER_GLOBAL
-
         query_params = parse_qs(urlparse(self.path).query)
         code = query_params.get("code", [None])[0]
         state = query_params.get("state", [None])[0]
-
         AUTH_STATE_RECEIVED_GLOBAL = state
 
         if state is None or state != self.original_csrf_state:
@@ -330,7 +319,7 @@ class _CallbackHandler(BaseHTTPRequestHandler):
             self.send_header("Content-type", "text/html")
             self.end_headers()
             self.wfile.write(
-                b"<html><body><h1>Error: State mismatch (CSRF protection).</h1><p>Please try logging in again.</p></body></html>"
+                b"<html><body><h1>Error: State mismatch.</h1></body></html>"
             )
             logging.error(
                 "OAuth callback state mismatch. Expected: %s, Got: %s",
@@ -344,16 +333,16 @@ class _CallbackHandler(BaseHTTPRequestHandler):
             self.send_header("Content-type", "text/html")
             self.end_headers()
             self.wfile.write(
-                b"<html><body><h1>Authentication successful!</h1><p>You can close this browser window and return to the terminal.</p></body></html>"
+                b"<html><body><h1>Auth successful! Close window.</h1></body></html>"
             )
-            logging.info("OAuth authorization code received successfully via callback.")
+            logging.info("OAuth authorization code received.")
         else:
             error = query_params.get("error", ["Unknown OAuth error"])[0]
             self.send_response(400)
             self.send_header("Content-type", "text/html")
             self.end_headers()
             self.wfile.write(
-                f"<html><body><h1>Authentication Failed</h1><p>Error: {error}. Please try again.</p></body></html>".encode(
+                f"<html><body><h1>Auth Failed: {error}</h1></body></html>".encode(
                     "utf-8"
                 )
             )
@@ -377,27 +366,21 @@ def _start_oauth_callback_server(csrf_state):
     try:
         OAUTH_HTTP_SERVER_GLOBAL = HTTPServer(server_address, handler_factory)
     except OSError as e:
-        logging.error(
-            "Could not start OAuth callback server on %s: %s", server_address, e
-        )
-        print(
-            f"Error: Could not start callback server on {parsed_redirect_uri.hostname}:{parsed_redirect_uri.port}. Port might be in use."
-        )
+        logging.error("Could not start OAuth server on %s: %s", server_address, e)
+        print(f"Error: Port {parsed_redirect_uri.port} might be in use.")
         return None
-
     logging.info(
-        "Starting OAuth callback server on %s://%s:%s%s",
+        "Starting OAuth server on %s://%s:%s%s",
         parsed_redirect_uri.scheme,
         parsed_redirect_uri.hostname,
         parsed_redirect_uri.port,
         parsed_redirect_uri.path,
     )
-
     server_thread = threading.Thread(
         target=OAUTH_HTTP_SERVER_GLOBAL.serve_forever, daemon=True
     )
     server_thread.start()
-    logging.info("OAuth callback server started and listening.")
+    logging.info("OAuth server started.")
     return server_thread
 
 
@@ -408,24 +391,20 @@ def get_current_user_id(access_token_override=None):
     if tokens and "user_id" in tokens:
         logging.debug("Using stored user ID: %s", tokens["user_id"])
         return tokens["user_id"]
-
     logging.info("Fetching current user's profile to get user ID.")
     headers = {}
     if access_token_override:
         headers["Authorization"] = f"Bearer {access_token_override}"
-
     response_json = make_spotify_request(f"{API_BASE_URL}/me", headers=headers)
-
     if response_json and "id" in response_json:
         user_id = response_json["id"]
         logging.info("Fetched user ID: %s", user_id)
-        if tokens:
+        if tokens:  # tokens might be None if get_access_token failed
             tokens["user_id"] = user_id
             save_tokens(tokens)
         return user_id
-    else:
-        logging.error("Could not fetch user ID from /me endpoint.")
-        return None
+    logging.error("Could not fetch user ID from /me endpoint.")
+    return None
 
 
 def get_playlist_track_uris(playlist_id):
@@ -434,40 +413,24 @@ def get_playlist_track_uris(playlist_id):
     track_uris = set()
     limit = 50
     offset = 0
-
     while True:
-        # Request only the track URI and if there's a next page
         fields = "items(track(uri)),next"
         params = {"limit": limit, "offset": offset, "fields": fields}
-        logging.debug(
-            "Fetching track URIs for playlist %s: offset=%s, limit=%s",
-            playlist_id,
-            offset,
-            limit,
-        )
-
+        logging.debug("Fetching track URIs page for %s: offset=%s", playlist_id, offset)
         response_json = make_spotify_request(
             f"{API_BASE_URL}/playlists/{playlist_id}/tracks", params=params
         )
-
         if not response_json or "items" not in response_json:
-            logging.warning(
-                "Failed to fetch track URIs for playlist %s or malformed response.",
-                playlist_id,
-            )
-            return None  # Indicate error
-
+            logging.warning("Failed to fetch track URIs for %s.", playlist_id)
+            return None
         for item in response_json.get("items", []):
-            track_data = item.get("track")
-            if track_data and track_data.get("uri"):  # Ensure track and URI exist
-                track_uris.add(track_data["uri"])
-
+            if item.get("track") and item["track"].get("uri"):
+                track_uris.add(item["track"]["uri"])
         if response_json.get("next"):
             offset += limit
-            time.sleep(0.05)  # Small polite delay
+            time.sleep(0.05)
         else:
-            break  # No more pages
-
+            break
     logging.info(
         "Found %s unique track URIs in playlist %s.", len(track_uris), playlist_id
     )
@@ -477,21 +440,31 @@ def get_playlist_track_uris(playlist_id):
 # --- Command Handler Functions ---
 def handle_login(args):
     """Handles the 'login' command to authenticate with Spotify."""
-    global AUTH_CODE_GLOBAL, AUTH_STATE_RECEIVED_GLOBAL, OAUTH_HTTP_SERVER_GLOBAL
+    global AUTH_CODE_GLOBAL, AUTH_STATE_RECEIVED_GLOBAL, OAUTH_HTTP_SERVER_GLOBAL, PKCE_CODE_VERIFIER_GLOBAL
 
-    if CLIENT_ID == "YOUR_CLIENT_ID" or CLIENT_SECRET == "YOUR_CLIENT_SECRET":
-        print("CRITICAL: CLIENT_ID or CLIENT_SECRET is not set in the script.")
+    if CLIENT_ID == "YOUR_CLIENT_ID":
         print(
-            "Please edit the script (spotify_playlist.py) near the top to add your Spotify API credentials."
+            "CRITICAL: CLIENT_ID is not set. Edit the script to add your Spotify API Client ID."
         )
-        print(
-            "You can obtain these from the Spotify Developer Dashboard: https://developer.spotify.com/dashboard/"
-        )
-        logging.critical("Login attempt with placeholder CLIENT_ID/CLIENT_SECRET.")
+        logging.critical("Login attempt with placeholder CLIENT_ID.")
         return
 
-    csrf_state = base64.urlsafe_b64encode(os.urandom(16)).decode()
-    logging.debug("Generated CSRF state for login: %s", csrf_state)
+    csrf_state = base64.urlsafe_b64encode(os.urandom(16)).decode("utf-8").rstrip("=")
+    logging.debug("Generated CSRF state: %s", csrf_state)
+
+    # PKCE: Generate code verifier and challenge
+    PKCE_CODE_VERIFIER_GLOBAL = (
+        base64.urlsafe_b64encode(os.urandom(32)).decode("utf-8").rstrip("=")
+    )
+    logging.debug("PKCE code_verifier (first 10): %s", PKCE_CODE_VERIFIER_GLOBAL[:10])
+    code_challenge = (
+        base64.urlsafe_b64encode(
+            hashlib.sha256(PKCE_CODE_VERIFIER_GLOBAL.encode("utf-8")).digest()
+        )
+        .decode("utf-8")
+        .rstrip("=")
+    )
+    logging.debug("PKCE code_challenge (first 10): %s", code_challenge[:10])
 
     AUTH_CODE_GLOBAL = None
     AUTH_STATE_RECEIVED_GLOBAL = None
@@ -503,386 +476,256 @@ def handle_login(args):
         "client_id": CLIENT_ID,
         "response_type": "code",
         "redirect_uri": REDIRECT_URI,
-        "scope": " ".join(
-            SCOPES_LIST
-        ),  # Join the list of scopes into a space-separated string
+        "scope": " ".join(SCOPES_LIST),
         "state": csrf_state,
+        "code_challenge_method": "S256",  # PKCE parameter
+        "code_challenge": code_challenge,  # PKCE parameter
     }
     authorization_url = f"{AUTH_URL}?{urlencode(auth_params)}"
-
     print(
-        "\nTo authorize this application, please open the following URL in your web browser:"
+        f"\nPlease open this URL in your browser to authorize:\n{authorization_url}\nWaiting..."
     )
-    print(authorization_url)
-    print("\nWaiting for authorization...")
-
     try:
         webbrowser.open(authorization_url)
         logging.info("Opened browser for Spotify authorization.")
     except Exception as e:
-        logging.warning(
-            "Could not open browser automatically: %s. Please open the URL manually.", e
-        )
+        logging.warning("Could not open browser: %s. Open URL manually.", e)
 
-    server_thread.join(timeout=180)
-
+    server_thread.join(timeout=180)  # Wait for callback
     if OAUTH_HTTP_SERVER_GLOBAL:
         OAUTH_HTTP_SERVER_GLOBAL.server_close()
         OAUTH_HTTP_SERVER_GLOBAL = None
 
     if AUTH_CODE_GLOBAL is None:
-        logging.error(
-            "Login timeout or callback server failed to receive authorization code."
-        )
-        print("Login timed out or was cancelled.")
+        logging.error("Login timeout or callback server error.")
+        print("Login timed out/cancelled.")
         return
-
-    if AUTH_CODE_GLOBAL.startswith("error_csrf_"):
-        logging.error("Login failed due to CSRF state mismatch: %s", AUTH_CODE_GLOBAL)
+    if AUTH_CODE_GLOBAL.startswith("error_"):
+        logging.error("Login failed: %s", AUTH_CODE_GLOBAL)
         print(
-            f"Login failed: {AUTH_CODE_GLOBAL.replace('error_csrf_', '').replace('_', ' ')}. Please try again."
+            f"Login failed: {AUTH_CODE_GLOBAL.replace('error_', '').replace('_', ' ')}. Try again."
         )
         return
-    if AUTH_CODE_GLOBAL.startswith("error_oauth_"):
-        logging.error(
-            "Login failed due to OAuth error from Spotify: %s", AUTH_CODE_GLOBAL
-        )
-        print(
-            f"Login failed: Spotify reported an error ({AUTH_CODE_GLOBAL.replace('error_oauth_', '')}). Please try again."
-        )
-        return
+    logging.info("Auth code obtained (first 20): %s...", AUTH_CODE_GLOBAL[:20])
 
-    logging.info("Authorization code obtained: %s...", AUTH_CODE_GLOBAL[:20])
-
+    # Exchange auth code for token using PKCE
     token_payload = {
         "grant_type": "authorization_code",
         "code": AUTH_CODE_GLOBAL,
         "redirect_uri": REDIRECT_URI,
+        "client_id": CLIENT_ID,
+        "code_verifier": PKCE_CODE_VERIFIER_GLOBAL,  # Send the verifier
     }
-
-    client_credentials = f"{CLIENT_ID}:{CLIENT_SECRET}"
-    auth_header_value = base64.b64encode(client_credentials.encode()).decode()
-    token_headers = {
-        "Authorization": f"Basic {auth_header_value}",
-        "Content-Type": "application/x-www-form-urlencoded",
-    }
-
     try:
-        logging.info("Exchanging authorization code for tokens.")
-        response = requests.post(
-            TOKEN_URL, data=token_payload, headers=token_headers, timeout=15
-        )
+        logging.info("Exchanging auth code for token (PKCE).")
+        # No Authorization header with client secret for PKCE
+        response = requests.post(TOKEN_URL, data=token_payload, timeout=15)
         response.raise_for_status()
-
         token_data = response.json()
         token_data["expires_at"] = time.time() + token_data["expires_in"]
 
+        # Fetch user ID and store it with tokens
         user_id = get_current_user_id(access_token_override=token_data["access_token"])
         if user_id:
             token_data["user_id"] = user_id
         else:
-            logging.warning(
-                "Could not fetch user_id immediately after login, but tokens are stored."
-            )
+            logging.warning("Could not fetch user_id immediately after login.")
 
         save_tokens(token_data)
-        print("Login successful! Tokens have been stored.")
-        logging.info("Tokens successfully obtained and stored.")
-
+        print("Login successful! Tokens stored.")
+        logging.info("Tokens obtained (PKCE) and stored.")
     except requests.exceptions.RequestException as e:
-        logging.error("Error exchanging code for token: %s", e)
+        logging.error("Error exchanging code for token (PKCE): %s", e)
         if hasattr(e, "response") and e.response is not None:
-            logging.error("Token exchange response content: %s", e.response.text)
+            logging.error("Token exchange response: %s", e.response.text)
             try:
                 error_info = e.response.json()
                 print(
-                    f"Failed to obtain access token: {error_info.get('error_description', e.response.text)}"
+                    f"Token exchange failed: {error_info.get('error_description', e.response.text)}"
                 )
             except json.JSONDecodeError:
-                print(
-                    f"Failed to obtain access token. Server response: {e.response.text}"
-                )
+                print(f"Token exchange failed. Server response: {e.response.text}")
         else:
-            print(
-                f"Failed to obtain access token due to a network or request error: {e}"
-            )
+            print(f"Token exchange failed due to a network error: {e}")
 
 
 def handle_list_playlists(args):
     """Handles the 'list' command to display user's playlists."""
     logging.info("Executing 'list playlists' command.")
-    all_playlists_data = []
+    all_playlists = []
     limit = 50
     offset = 0
-
     while True:
         params = {
             "limit": limit,
             "offset": offset,
-            "fields": "items(id,name,tracks(total)),next,total",
+            "fields": "items(id,name,tracks(total)),next",
         }
-        logging.debug("Fetching playlists: offset=%s, limit=%s", offset, limit)
-
-        response_json = make_spotify_request(
-            f"{API_BASE_URL}/me/playlists", params=params
-        )
-
-        if not response_json or "items" not in response_json:
-            logging.warning("Failed to fetch playlists or response was malformed.")
+        logging.debug("Fetching playlists page: offset=%s", offset)
+        response = make_spotify_request(f"{API_BASE_URL}/me/playlists", params=params)
+        if not response or "items" not in response:
+            logging.warning("Failed to fetch playlists or malformed response.")
             return
-
-        all_playlists_data.extend(response_json.get("items", []))
-
-        if response_json.get("next"):
+        all_playlists.extend(response.get("items", []))
+        if response.get("next"):
             offset += limit
             time.sleep(0.05)
         else:
             break
-
-    if not all_playlists_data:
-        print("No playlists found for your account.")
+    if not all_playlists:
+        print("No playlists found.")
     else:
-        print(f"\nYour Playlists ({len(all_playlists_data)} total):")
-        for item in all_playlists_data:
-            print(f"  ID: {item['id']}")
-            print(f"  Name: {item['name']}")
-            print(f"  Tracks: {item.get('tracks', {}).get('total', 'N/A')}")
-            print("-" * 20)
-    logging.info("Displayed %s playlists.", len(all_playlists_data))
+        print(f"\nYour Playlists ({len(all_playlists)} total):")
+        for item in all_playlists:
+            print(
+                f"  ID: {item['id']}\n  Name: {item['name']}\n  Tracks: {item.get('tracks',{}).get('total','N/A')}\n{'-'*20}"
+            )
+    logging.info("Displayed %s playlists.", len(all_playlists))
 
 
 def handle_get_tracks(args):
     """Handles the 'get-tracks' command for a specific playlist."""
     playlist_id = args.playlist_id
     logging.info("Executing 'get-tracks' for playlist ID: %s", playlist_id)
-
-    all_tracks_formatted = []
-    limit = 50
-    offset = 0
-
     playlist_info = make_spotify_request(
         f"{API_BASE_URL}/playlists/{playlist_id}",
         params={"fields": "name,tracks(total)"},
     )
     if not playlist_info:
-        print(f"Could not retrieve information for playlist ID: {playlist_id}")
+        print(f"Could not get info for playlist {playlist_id}.")
         return
 
-    playlist_name = playlist_info.get("name", "Unknown Playlist")
-    total_tracks_expected = playlist_info.get("tracks", {}).get("total", "N/A")
-    print(
-        f"\nTracks for Playlist: '{playlist_name}' (ID: {playlist_id}, Total: {total_tracks_expected}):"
-    )
+    name = playlist_info.get("name", "?")
+    total = playlist_info.get("tracks", {}).get("total", "?")
+    print(f"\nTracks for '{name}' (ID: {playlist_id}, Total: {total}):")
 
+    all_tracks = []
+    limit = 50
+    offset = 0
     while True:
         fields = "items(track(name,album(name),artists(name),uri,is_local)),next"
         params = {"limit": limit, "offset": offset, "fields": fields}
-        logging.debug(
-            "Fetching tracks for playlist %s: offset=%s, limit=%s",
-            playlist_id,
-            offset,
-            limit,
-        )
-
-        response_json = make_spotify_request(
+        logging.debug("Fetching tracks page for %s: offset=%s", playlist_id, offset)
+        response = make_spotify_request(
             f"{API_BASE_URL}/playlists/{playlist_id}/tracks", params=params
         )
-
-        if not response_json or "items" not in response_json:
-            logging.warning(
-                "Failed to fetch tracks for playlist %s or malformed response.",
-                playlist_id,
-            )
+        if not response or "items" not in response:
+            logging.warning("Failed to fetch tracks for %s.", playlist_id)
             return
-
-        for item in response_json.get("items", []):
-            track_data = item.get("track")
-            if track_data:
-                if track_data.get("is_local", False):
-                    all_tracks_formatted.append(
-                        f"[Local Track] - {track_data.get('name', 'Unknown Track')}"
-                    )
+        for item in response.get("items", []):
+            t = item.get("track")
+            if t:
+                if t.get("is_local", False):
+                    all_tracks.append(f"[Local] - {t.get('name','?')}")
                 else:
-                    track_name = track_data.get("name", "Unknown Track")
-                    album_name = track_data.get("album", {}).get(
-                        "name", "Unknown Album"
+                    artists = ", ".join(
+                        [a.get("name", "?") for a in t.get("artists", [])]
                     )
-                    artist_names = ", ".join(
-                        [
-                            artist.get("name", "Unknown Artist")
-                            for artist in track_data.get("artists", [])
-                        ]
-                    )
-                    all_tracks_formatted.append(
-                        f"{artist_names} - {album_name} - {track_name}"
+                    all_tracks.append(
+                        f"{artists} - {t.get('album',{}).get('name','?')} - {t.get('name','?')}"
                     )
             else:
-                all_tracks_formatted.append("[Unavailable Track]")
-
-        if response_json.get("next"):
+                all_tracks.append("[Unavailable Track]")
+        if response.get("next"):
             offset += limit
             time.sleep(0.05)
         else:
             break
-
-    if not all_tracks_formatted:
-        print(f"No tracks found in playlist '{playlist_name}' or it might be empty.")
+    if not all_tracks:
+        print("No tracks found or playlist is empty.")
     else:
-        for track_line in all_tracks_formatted:
+        for track_line in all_tracks:
             print(f"  - {track_line}")
-    logging.info(
-        "Displayed %s tracks for playlist %s.", len(all_tracks_formatted), playlist_id
-    )
+    logging.info("Displayed %s tracks for playlist %s.", len(all_tracks), playlist_id)
 
 
 def handle_create_playlist(args):
     """Handles the 'create' command to make a new playlist."""
-    playlist_name = args.name
-    description = args.description or ""
-    public_playlist = not args.private
-    collaborative_playlist = args.collaborative
-
+    name = args.name
+    desc = args.description or ""
+    public = not args.private
+    collab = args.collaborative
     logging.info(
-        "Executing 'create playlist': Name='%s', Public=%s, Collab=%s",
-        playlist_name,
-        public_playlist,
-        collaborative_playlist,
+        "Create playlist: Name='%s', Public=%s, Collab=%s", name, public, collab
     )
-
     user_id = get_current_user_id()
     if not user_id:
-        print(
-            "Error: Could not determine your User ID. Please try logging in again or ensure you are logged in."
-        )
-        logging.error("Create playlist failed: User ID could not be fetched/found.")
+        print("Error: Could not get User ID. Login again.")
+        logging.error("Create failed: no User ID.")
         return
+    if collab and public:
+        logging.warning("Collab playlists must be private.")
+        print("Note: Collab playlists are set to private.")
+        public = False
 
-    if collaborative_playlist and public_playlist:
-        logging.warning(
-            "Collaborative playlists must be private. Setting playlist to private for creation."
-        )
-        print(
-            "Note: Collaborative playlists are automatically set to private by Spotify."
-        )
-        public_playlist = False
-
-    create_url = f"{API_BASE_URL}/users/{user_id}/playlists"
     payload = {
-        "name": playlist_name,
-        "public": public_playlist,
-        "collaborative": collaborative_playlist,
-        "description": description,
+        "name": name,
+        "public": public,
+        "collaborative": collab,
+        "description": desc,
     }
-
     logging.debug("Creating playlist with payload: %s", payload)
-    response_json = make_spotify_request(create_url, method="POST", data=payload)
-
-    if response_json and "id" in response_json:
-        created_playlist_name = response_json.get("name", playlist_name)
-        created_playlist_id = response_json["id"]
-        print(f"Playlist '{created_playlist_name}' created successfully!")
-        print(f"  ID: {created_playlist_id}")
-        print(f"  Link: {response_json.get('external_urls', {}).get('spotify', 'N/A')}")
-        logging.info(
-            "Playlist '%s' (ID: %s) created.",
-            created_playlist_name,
-            created_playlist_id,
-        )
+    response = make_spotify_request(
+        f"{API_BASE_URL}/users/{user_id}/playlists", method="POST", data=payload
+    )
+    if response and "id" in response:
+        p_name = response.get("name", name)
+        p_id = response["id"]
+        link = response.get("external_urls", {}).get("spotify", "N/A")
+        print(f"Playlist '{p_name}' created!\n  ID: {p_id}\n  Link: {link}")
+        logging.info("Playlist '%s' (ID: %s) created.", p_name, p_id)
     else:
-        logging.error(
-            "Failed to create playlist '%s'. Response: %s", playlist_name, response_json
-        )
+        logging.error("Failed to create playlist '%s'. Response: %s", name, response)
 
 
 def handle_add_track(args):
     """Handles the 'add-track' command to search and add a track, preventing duplicates."""
-    playlist_id = args.playlist_id
-    search_query = args.query
-    logging.info(
-        "Executing 'add-track': PlaylistID='%s', Query='%s'", playlist_id, search_query
-    )
+    p_id = args.playlist_id
+    query = args.query
+    logging.info("Add track: PlaylistID='%s', Query='%s'", p_id, query)
 
-    # 1. Search for the track
-    search_params = {"q": search_query, "type": "track", "limit": 1}
-    logging.debug("Searching for track with query: '%s'", search_query)
-    search_response_json = make_spotify_request(
-        f"{API_BASE_URL}/search", params=search_params
-    )
-
+    search_params = {"q": query, "type": "track", "limit": 1}
+    logging.debug("Searching for track: '%s'", query)
+    s_response = make_spotify_request(f"{API_BASE_URL}/search", params=search_params)
     if (
-        not search_response_json
-        or not search_response_json.get("tracks")
-        or not search_response_json["tracks"].get("items")
+        not s_response
+        or not s_response.get("tracks")
+        or not s_response["tracks"].get("items")
     ):
-        print(f"Error: Track search for '{search_query}' failed or found no results.")
-        logging.error(
-            "Search for '%s' yielded no results or bad response: %s",
-            search_query,
-            search_response_json,
-        )
+        print(f"Error: Track search for '{query}' failed or no results.")
+        logging.error("Search '%s' no results: %s", query, s_response)
         return
 
-    found_track = search_response_json["tracks"]["items"][0]
-    track_uri = found_track["uri"]
-    track_name = found_track["name"]
-    artist_names = ", ".join(
-        [artist["name"] for artist in found_track.get("artists", [])]
-    )
+    track = s_response["tracks"]["items"][0]
+    uri = track["uri"]
+    name = track["name"]
+    artists = ", ".join([a["name"] for a in track.get("artists", [])])
+    logging.info("Found: '%s' by %s (URI: %s)", name, artists, uri)
+    print(f"Found: '{name}' by {artists}.")
 
-    logging.info(
-        "Found track: '%s' by %s (URI: %s)", track_name, artist_names, track_uri
-    )
-    print(f"Found track: '{track_name}' by {artist_names}.")
-
-    # 2. Check if track already exists in the playlist
-    logging.info(
-        "Checking for duplicate track URI %s in playlist %s.", track_uri, playlist_id
-    )
-    existing_track_uris = get_playlist_track_uris(playlist_id)
-
-    if existing_track_uris is None:
-        # Error occurred while fetching existing tracks, get_playlist_track_uris would have logged it.
-        print(
-            f"Could not verify existing tracks in playlist {playlist_id}. Aborting add operation."
-        )
+    logging.info("Checking for duplicate URI %s in playlist %s.", uri, p_id)
+    existing_uris = get_playlist_track_uris(p_id)
+    if existing_uris is None:
+        print(f"Could not verify existing tracks in {p_id}. Aborting.")
+        return
+    if uri in existing_uris:
+        print(f"Track '{name}' by {artists} already in playlist {p_id}.")
+        logging.info("Track %s already in %s.", uri, p_id)
         return
 
-    if track_uri in existing_track_uris:
-        print(
-            f"Track '{track_name}' by {artist_names} (URI: {track_uri}) is already in playlist {playlist_id}."
-        )
+    add_payload = {"uris": [uri]}
+    logging.debug("Adding URI %s to playlist %s", uri, p_id)
+    response = make_spotify_request(
+        f"{API_BASE_URL}/playlists/{p_id}/tracks", method="POST", data=add_payload
+    )
+    if response and (response.get("snapshot_id") or response.get("status_code") == 201):
+        print(f"Track '{name}' added to playlist {p_id}.")
         logging.info(
-            "Track %s already exists in playlist %s. Skipping add.",
-            track_uri,
-            playlist_id,
-        )
-        return
-
-    # 3. Add the track to the specified playlist if not a duplicate
-    add_track_url = f"{API_BASE_URL}/playlists/{playlist_id}/tracks"
-    add_track_payload = {"uris": [track_uri]}
-
-    logging.debug("Adding track URI %s to playlist %s", track_uri, playlist_id)
-    response_json = make_spotify_request(
-        add_track_url, method="POST", data=add_track_payload
-    )
-
-    if response_json and (
-        response_json.get("snapshot_id") or response_json.get("status_code") == 201
-    ):
-        print(f"Track '{track_name}' added successfully to playlist ID {playlist_id}.")
-        logging.info(
-            "Track '%s' (URI: %s) added. Snapshot ID: %s",
-            track_name,
-            track_uri,
-            response_json.get("snapshot_id", "N/A"),
+            "Track '%s' added. Snapshot: %s", uri, response.get("snapshot_id", "N/A")
         )
     else:
         logging.error(
-            "Failed to add track '%s' to playlist %s. Response: %s",
-            track_name,
-            playlist_id,
-            response_json,
+            "Failed to add track '%s' to %s. Response: %s", name, p_id, response
         )
 
 
@@ -890,71 +733,44 @@ def handle_add_track(args):
 def main():
     """Main function to parse arguments and dispatch commands."""
     parser = argparse.ArgumentParser(
-        description="A command-line tool to manage Spotify playlists.",
-        epilog="Before first use, run 'login'. Ensure CLIENT_ID and CLIENT_SECRET are set in the script.",
+        description="Manage Spotify playlists via CLI.",
+        epilog="Run 'login' first. Ensure CLIENT_ID is set in script.",
     )
     parser.add_argument(
         "--loglevel",
         default="WARNING",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-        help="Set the logging level (default: WARNING).",
+        help="Logging level.",
     )
 
-    subparsers = parser.add_subparsers(
-        title="commands", dest="command", required=True, help="Available commands"
+    subs = parser.add_subparsers(title="commands", dest="command", required=True)
+    subs.add_parser("login", help="Authenticate with Spotify.").set_defaults(
+        func=handle_login
     )
-
-    parser_login = subparsers.add_parser(
-        "login", help="Authenticate with Spotify and store credentials."
+    subs.add_parser("list", help="List your playlists.").set_defaults(
+        func=handle_list_playlists
     )
-    parser_login.set_defaults(func=handle_login)
-
-    parser_list = subparsers.add_parser("list", help="List all your Spotify playlists.")
-    parser_list.set_defaults(func=handle_list_playlists)
-
-    parser_get_tracks = subparsers.add_parser(
-        "get-tracks", help="List tracks for a specific playlist."
-    )
-    parser_get_tracks.add_argument(
-        "playlist_id", help="The ID of the playlist (e.g., from 'list' command)."
-    )
-    parser_get_tracks.set_defaults(func=handle_get_tracks)
-
-    parser_create = subparsers.add_parser(
-        "create", help="Create a new Spotify playlist."
-    )
-    parser_create.add_argument("name", help="Name for the new playlist.")
-    parser_create.add_argument(
-        "--description", help="Optional description for the playlist.", default=""
-    )
-    parser_create.add_argument(
-        "--private",
-        action="store_true",
-        help="Make the playlist private (default is public).",
-    )
-    parser_create.add_argument(
+    p_get = subs.add_parser("get-tracks", help="List tracks for a playlist.")
+    p_get.add_argument("playlist_id", help="Playlist ID.")
+    p_get.set_defaults(func=handle_get_tracks)
+    p_create = subs.add_parser("create", help="Create a playlist.")
+    p_create.add_argument("name", help="Playlist name.")
+    p_create.add_argument("--description", default="", help="Description.")
+    p_create.add_argument("--private", action="store_true", help="Make private.")
+    p_create.add_argument(
         "--collaborative",
         action="store_true",
-        help="Make the playlist collaborative (implies private).",
+        help="Make collaborative (implies private).",
     )
-    parser_create.set_defaults(func=handle_create_playlist)
-
-    parser_add_track = subparsers.add_parser(
-        "add-track", help="Search for a track and add it to a playlist."
-    )
-    parser_add_track.add_argument(
-        "playlist_id", help="The ID of the playlist to add the track to."
-    )
-    parser_add_track.add_argument(
-        "query", help="Search query for the track (e.g., 'Artist Name - Track Title')."
-    )
-    parser_add_track.set_defaults(func=handle_add_track)
+    p_create.set_defaults(func=handle_create_playlist)
+    p_add = subs.add_parser("add-track", help="Search and add track to playlist.")
+    p_add.add_argument("playlist_id", help="Playlist ID to add to.")
+    p_add.add_argument("query", help="Track search query.")
+    p_add.set_defaults(func=handle_add_track)
 
     args = parser.parse_args()
 
-    log_file_path = os.path.join(
-        os.path.dirname(os.path.abspath(TOKEN_FILE)), "spotify_playlist.log"
-    )
+    log_file_path = os.path.join(SCRIPT_DIR, "spotify_playlist.log")
     logging.basicConfig(
         level=getattr(logging, args.loglevel.upper()),
         format="%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(module)s.%(funcName)s - %(message)s",
@@ -963,22 +779,12 @@ def main():
             logging.StreamHandler(),
         ],
     )
-
-    logging.info(
-        "Application started with command: %s, loglevel: %s",
-        args.command,
-        args.loglevel,
-    )
-    if CLIENT_ID == "YOUR_CLIENT_ID" or CLIENT_SECRET == "YOUR_CLIENT_SECRET":
-        logging.warning(
-            "CLIENT_ID or CLIENT_SECRET are placeholders. Login might fail or be limited."
-        )
+    logging.info("App started. Command: %s, LogLevel: %s", args.command, args.loglevel)
+    if CLIENT_ID == "YOUR_CLIENT_ID":
+        logging.warning("CLIENT_ID is a placeholder. Login will likely fail.")
         if args.command != "login":
             print(
-                "Warning: CLIENT_ID or CLIENT_SECRET are not configured in the script. Some operations may fail."
-            )
-            print(
-                "Please edit spotify_playlist.py to set your Spotify API credentials."
+                "Warning: CLIENT_ID not configured. Edit script. Operations may fail."
             )
 
     if hasattr(args, "func"):
@@ -986,14 +792,9 @@ def main():
             args.func(args)
         except Exception as e:
             logging.critical(
-                "An unhandled exception occurred in command '%s': %s",
-                args.command,
-                e,
-                exc_info=True,
+                "Unhandled exception in '%s': %s", args.command, e, exc_info=True
             )
-            print(
-                f"An unexpected error occurred: {e}. Check '{log_file_path}' for details."
-            )
+            print(f"Unexpected error: {e}. Check '{log_file_path}' for details.")
     else:
         parser.print_help()
 
