@@ -21,7 +21,7 @@ import requests
 # --- Constants ---
 # IMPORTANT: Replace this with your actual Spotify Application Client ID
 # You can get this from the Spotify Developer Dashboard: https://developer.spotify.com/dashboard/
-CLIENT_ID = "YOUR_CLIENT_ID"
+CLIENT_ID = "ef7c1b8bea424297ba96dd0c8f6b4c1f"
 
 # IMPORTANT: Make sure this Redirect URI is added to your Spotify Application's settings
 # in the Spotify Developer Dashboard.
